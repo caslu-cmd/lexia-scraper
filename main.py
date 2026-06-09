@@ -1,0 +1,286 @@
+"""
+lexia-scraper — scraping de processos judiciais (eSAJ + PJe).
+Roda em servidor brasileiro (Railway SA East) para contornar o bloqueio de IPs
+estrangeiros pelos portais dos tribunais.
+
+Salva os processos encontrados diretamente no Supabase via service_role.
+"""
+
+import os, re, asyncio, httpx
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+from supabase import create_client, Client
+from typing import Optional
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+CRON_SECRET  = os.environ.get("CRON_SECRET", "cron-secret")
+
+app = FastAPI(title="LexIA Scraper", version="1.0.0")
+
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+CNJ_RE = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def check_auth(authorization: str):
+    if authorization != f"Bearer {CRON_SECRET}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+def get_owner(organization_id: str) -> Optional[str]:
+    r = sb.from_("organization_members")\
+          .select("user_id")\
+          .eq("organization_id", organization_id)\
+          .eq("role", "admin")\
+          .single()\
+          .execute()
+    return r.data["user_id"] if r.data else None
+
+def salvar_processo(organization_id: str, owner_id: str, numero: str,
+                    nome: str, tribunal: str, fonte: str) -> bool:
+    ex = sb.from_("processos")\
+           .select("id")\
+           .eq("organization_id", organization_id)\
+           .eq("numero", numero)\
+           .maybe_single()\
+           .execute()
+    if ex.data:
+        return False  # já existe
+    sb.from_("processos").insert({
+        "organization_id": organization_id,
+        "owner_id": owner_id,
+        "numero": numero,
+        "titulo": f"Processo {numero}",
+        "parte": nome,
+        "tribunal": tribunal,
+        "status": "ativo",
+        "fonte": fonte,
+    }).execute()
+    return True
+
+# ─── eSAJ TJCE ────────────────────────────────────────────────────────────────
+
+async def esaj_obter_sessao(client: httpx.AsyncClient) -> str:
+    try:
+        r = await client.get(
+            "https://esaj.tjce.jus.br/cpopg/open.do",
+            headers={"User-Agent": UA},
+            follow_redirects=True,
+            timeout=15,
+        )
+        sc = r.headers.get("set-cookie", "")
+        # httpx junta cookies automaticamente, mas tenta extrair manualmente
+        match = re.search(r"JSESSIONID=([^;]+)", sc)
+        if match:
+            return match.group(1)
+        # Fallback: cookies do httpx
+        jsid = client.cookies.get("JSESSIONID")
+        return jsid or ""
+    except Exception as e:
+        print(f"[eSAJ] sessão: {e}")
+        return ""
+
+async def esaj_buscar(oab: str, uf: str, jsession: str) -> list[str]:
+    numeros: list[str] = []
+    cookies = {"JSESSIONID": jsession} if jsession else {}
+    async with httpx.AsyncClient(cookies=cookies, follow_redirects=True, timeout=25) as c:
+        for pagina in range(1, 11):
+            try:
+                r = await c.post(
+                    "https://esaj.tjce.jus.br/cpopg/search.do",
+                    headers={
+                        "User-Agent": UA,
+                        "Referer": "https://esaj.tjce.jus.br/cpopg/open.do",
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                    data={
+                        "conversationId": "",
+                        "cbPesquisa": "NUMOAB",
+                        "dePesquisaNuOAB": oab,
+                        "dePesquisaUfOAB": uf,
+                        "gateway": "true",
+                        "paginaConsulta": str(pagina),
+                        "localPesquisa": "INTERF_INICIAL",
+                    },
+                )
+                html = r.text
+            except Exception as e:
+                print(f"[eSAJ] p{pagina}: {e}")
+                break
+
+            if any(x in html for x in ["Não existem", "nenhum processo", "Nenhum processo"]) \
+               or len(html) < 1000:
+                break
+
+            found = list(set(CNJ_RE.findall(html)))
+            if not found:
+                break
+            for n in found:
+                if n not in numeros:
+                    numeros.append(n)
+
+            if not any(x in html for x in ["Próxima", "próxima", "paginaConsulta"]):
+                break
+
+    return numeros
+
+# ─── PJe (TJCE, TRT7, TRF5) ──────────────────────────────────────────────────
+
+PJE_INSTANCIAS_CE = [
+    {"nome": "TJCE", "base": "https://pje.tjce.jus.br/pje", "tribunal": "TJCE"},
+    {"nome": "TRT7", "base": "https://pje.trt7.jus.br/pje",  "tribunal": "TRT7"},
+    {"nome": "TRF5", "base": "https://pje.trf5.jus.br/pje",  "tribunal": "TRF5"},
+]
+
+async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
+    numeros: list[str] = []
+    base = inst["base"]
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+        # Tentativa 1: REST JSON
+        for url in [
+            f"{base}/rest/processo/consultapublica?oabNumero={oab}&oabUF={uf}&pagina=0&tamanhoPagina=50",
+            f"{base}/api/v1/processos?oabNumero={oab}&oabUf={uf}&size=50",
+        ]:
+            try:
+                r = await c.get(url, headers=headers)
+                if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
+                    j = r.json()
+                    items = j.get("content") or j.get("processos") or (j if isinstance(j, list) else [])
+                    for item in items:
+                        n = item.get("numeroProcesso") or item.get("numero")
+                        if n and CNJ_RE.match(n) and n not in numeros:
+                            numeros.append(n)
+                    if numeros:
+                        print(f"[PJe] {inst['nome']} REST: {len(numeros)}")
+                        return numeros
+            except Exception as e:
+                print(f"[PJe] {inst['nome']} REST: {e}")
+
+        # Tentativa 2: GET ViewState + POST HTML
+        try:
+            rg = await c.get(f"{base}/ConsultaPublica/listView.seam",
+                             headers={"User-Agent": UA})
+            vs_match = re.search(r'id="javax\.faces\.ViewState"[^>]*value="([^"]+)"', rg.text)
+            vs = vs_match.group(1) if vs_match else "j_id1"
+
+            rp = await c.post(
+                f"{base}/ConsultaPublica/listView.seam",
+                headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": f"{base}/ConsultaPublica/listView.seam"},
+                data={
+                    "j_id132:oabNumero": oab,
+                    "j_id132:oabUF": uf,
+                    "javax.faces.ViewState": vs,
+                },
+            )
+            if rp.status_code == 200:
+                found = list(set(CNJ_RE.findall(rp.text)))
+                for n in found:
+                    if n not in numeros:
+                        numeros.append(n)
+                if found:
+                    print(f"[PJe] {inst['nome']} HTML: {len(found)}")
+        except Exception as e:
+            print(f"[PJe] {inst['nome']} HTML: {e}")
+
+    return numeros
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "lexia-scraper"}
+
+@app.post("/esaj-sync")
+async def esaj_sync(authorization: str = Header(...)):
+    check_auth(authorization)
+
+    oabs_res = sb.from_("oabs_monitoradas")\
+                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                 .eq("ativo", True)\
+                 .execute()
+    oabs = oabs_res.data or []
+    if not oabs:
+        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+
+    total_novos = 0
+    total_existiam = 0
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as sess_client:
+        jsession = await esaj_obter_sessao(sess_client)
+    print(f"[eSAJ] JSESSIONID: {'✅' if jsession else '❌'}")
+
+    for row in oabs:
+        if row["estado_oab"] != "CE":
+            continue
+        org_id = row["organization_id"]
+        oab    = row["numero_oab"]
+        nome   = row["nome_advogado"]
+
+        owner_id = get_owner(org_id)
+        if not owner_id:
+            continue
+
+        numeros = await esaj_buscar(oab, row["estado_oab"], jsession)
+        print(f"[eSAJ] CE {oab} ({nome}): {len(numeros)} processos")
+
+        for numero in numeros:
+            if salvar_processo(org_id, owner_id, numero, nome, "TJCE", "eSAJ"):
+                total_novos += 1
+            else:
+                total_existiam += 1
+
+    return {
+        "ok": True,
+        "fonte": "eSAJ",
+        "jsession_ok": bool(jsession),
+        "processos_novos": total_novos,
+        "ja_existiam": total_existiam,
+    }
+
+@app.post("/pje-sync")
+async def pje_sync(authorization: str = Header(...)):
+    check_auth(authorization)
+
+    oabs_res = sb.from_("oabs_monitoradas")\
+                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                 .eq("ativo", True)\
+                 .execute()
+    oabs = oabs_res.data or []
+    if not oabs:
+        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+
+    instancias_por_uf = {"CE": PJE_INSTANCIAS_CE}
+    total_novos = 0
+    total_existiam = 0
+
+    for row in oabs:
+        instancias = instancias_por_uf.get(row["estado_oab"])
+        if not instancias:
+            continue
+        org_id = row["organization_id"]
+        oab    = row["numero_oab"]
+        nome   = row["nome_advogado"]
+
+        owner_id = get_owner(org_id)
+        if not owner_id:
+            continue
+
+        for inst in instancias:
+            numeros = await pje_buscar(inst, oab, row["estado_oab"])
+            for numero in numeros:
+                if salvar_processo(org_id, owner_id, numero, nome, inst["tribunal"], "PJe"):
+                    total_novos += 1
+                else:
+                    total_existiam += 1
+
+    return {
+        "ok": True,
+        "fonte": "PJe",
+        "processos_novos": total_novos,
+        "ja_existiam": total_existiam,
+    }
