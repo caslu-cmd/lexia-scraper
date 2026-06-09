@@ -186,23 +186,29 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
                 if name:
                     form_data[name.group(1)] = value.group(1) if value else ""
 
-            # Campos obrigatórios do RichFaces/JSF
+            # Campos do RichFaces AJAX
             nome = inst["nome"]
             if "TJCE" in nome:
                 form_data["fPP:Decoration:numeroOAB"] = oab
                 form_data["fPP:searchProcessos"]      = "Pesquisar"
             else:
-                # Outros PJe podem usar campos diferentes
                 for key in list(form_data.keys()):
                     if "oab" in key.lower() and "numero" in key.lower():
                         form_data[key] = oab
-                form_data["javax.faces.ViewState"] = form_data.get("javax.faces.ViewState", "j_id1")
+
+            # RichFaces 3.x exige AJAXREQUEST para disparar busca AJAX
+            form_data["AJAXREQUEST"] = "_viewRoot"
+            form_data["javax.faces.ViewState"] = form_data.get("javax.faces.ViewState", "j_id1")
 
             rp = await c.post(
                 consulta_url,
-                headers={"User-Agent": UA,
-                         "Content-Type": "application/x-www-form-urlencoded",
-                         "Referer": consulta_url},
+                headers={
+                    "User-Agent": UA,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": consulta_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "text/html,application/xhtml+xml,*/*",
+                },
                 data=form_data,
             )
             if rp.status_code == 200:
