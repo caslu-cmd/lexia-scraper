@@ -285,42 +285,52 @@ async def esaj_sync(authorization: str = Header(...)):
 @app.post("/pje-sync")
 async def pje_sync(authorization: str = Header(...)):
     check_auth(authorization)
+    try:
+        oabs_res = sb.from_("oabs_monitoradas")\
+                     .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                     .eq("ativo", True)\
+                     .execute()
+        oabs = oabs_res.data or []
+        if not oabs:
+            return {"ok": True, "msg": "Nenhuma OAB ativa."}
 
-    oabs_res = sb.from_("oabs_monitoradas")\
-                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
-                 .eq("ativo", True)\
-                 .execute()
-    oabs = oabs_res.data or []
-    if not oabs:
-        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+        instancias_por_uf = {"CE": PJE_INSTANCIAS_CE}
+        total_novos = 0
+        total_existiam = 0
+        log = []
 
-    instancias_por_uf = {"CE": PJE_INSTANCIAS_CE}
-    total_novos = 0
-    total_existiam = 0
+        for row in oabs:
+            instancias = instancias_por_uf.get(row["estado_oab"])
+            if not instancias:
+                continue
+            org_id = row["organization_id"]
+            oab    = row["numero_oab"]
+            nome   = row["nome_advogado"]
 
-    for row in oabs:
-        instancias = instancias_por_uf.get(row["estado_oab"])
-        if not instancias:
-            continue
-        org_id = row["organization_id"]
-        oab    = row["numero_oab"]
-        nome   = row["nome_advogado"]
+            owner_id = get_owner(org_id)
+            if not owner_id:
+                log.append(f"sem owner para org {org_id}")
+                continue
 
-        owner_id = get_owner(org_id)
-        if not owner_id:
-            continue
+            for inst in instancias:
+                try:
+                    numeros = await pje_buscar(inst, oab, row["estado_oab"])
+                    log.append(f"{inst['nome']} OAB {oab}: {len(numeros)} encontrados")
+                    for numero in numeros:
+                        if salvar_processo(org_id, owner_id, numero, nome, inst["tribunal"], "PJe"):
+                            total_novos += 1
+                        else:
+                            total_existiam += 1
+                except Exception as e:
+                    log.append(f"{inst['nome']} OAB {oab} erro: {e}")
 
-        for inst in instancias:
-            numeros = await pje_buscar(inst, oab, row["estado_oab"])
-            for numero in numeros:
-                if salvar_processo(org_id, owner_id, numero, nome, inst["tribunal"], "PJe"):
-                    total_novos += 1
-                else:
-                    total_existiam += 1
-
-    return {
-        "ok": True,
-        "fonte": "PJe",
-        "processos_novos": total_novos,
-        "ja_existiam": total_existiam,
-    }
+        return {
+            "ok": True,
+            "fonte": "PJe",
+            "processos_novos": total_novos,
+            "ja_existiam": total_existiam,
+            "log": log,
+        }
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
