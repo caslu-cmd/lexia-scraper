@@ -40,14 +40,17 @@ def get_owner(organization_id: str) -> Optional[str]:
 
 def salvar_processo(organization_id: str, owner_id: str, numero: str,
                     nome: str, tribunal: str, fonte: str) -> bool:
-    ex = sb.from_("processos")\
-           .select("id")\
-           .eq("organization_id", organization_id)\
-           .eq("numero", numero)\
-           .maybe_single()\
-           .execute()
-    if ex.data:
-        return False  # já existe
+    try:
+        res = sb.from_("processos")\
+               .select("id")\
+               .eq("organization_id", organization_id)\
+               .eq("numero", numero)\
+               .limit(1)\
+               .execute()
+        if res and res.data:
+            return False  # já existe
+    except Exception:
+        pass
     sb.from_("processos").insert({
         "organization_id": organization_id,
         "owner_id": owner_id,
