@@ -195,6 +195,46 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
 def health():
     return {"ok": True, "service": "lexia-scraper"}
 
+@app.post("/esaj-debug")
+async def esaj_debug(authorization: str = Header(...)):
+    check_auth(authorization)
+    result = {}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as c:
+        # Sessão
+        try:
+            r = await c.get("https://esaj.tjce.jus.br/cpopg/open.do", headers={"User-Agent": UA})
+            jsession = c.cookies.get("JSESSIONID") or re.search(r"JSESSIONID=([^;]+)", r.headers.get("set-cookie","") or "")
+            if hasattr(jsession, "group"): jsession = jsession.group(1)
+            result["jsession"] = jsession or "não obtido"
+            result["open_status"] = r.status_code
+        except Exception as e:
+            result["open_error"] = str(e)
+            return result
+
+    # Busca OAB 10727 CE
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25,
+                                  cookies={"JSESSIONID": result.get("jsession","")}) as c:
+        try:
+            r2 = await c.post(
+                "https://esaj.tjce.jus.br/cpopg/search.do",
+                headers={"User-Agent": UA, "Referer": "https://esaj.tjce.jus.br/cpopg/open.do",
+                         "Accept": "text/html,application/xhtml+xml"},
+                data={"conversationId":"","cbPesquisa":"NUMOAB","dePesquisaNuOAB":"10727",
+                      "dePesquisaUfOAB":"CE","gateway":"true","paginaConsulta":"1",
+                      "localPesquisa":"INTERF_INICIAL"},
+            )
+            html = r2.text
+            result["search_status"] = r2.status_code
+            result["html_len"] = len(html)
+            result["html_snippet"] = html[:1500]
+            result["processos_encontrados"] = list(set(CNJ_RE.findall(html)))
+            result["tem_nao_existem"] = "Não existem" in html or "nenhum processo" in html
+            result["tem_captcha"] = "captcha" in html.lower()
+            result["final_url"] = str(r2.url)
+        except Exception as e:
+            result["search_error"] = str(e)
+    return result
+
 @app.post("/esaj-sync")
 async def esaj_sync(authorization: str = Header(...)):
     check_auth(authorization)
