@@ -149,16 +149,16 @@ PJE_INSTANCIAS_CE = [
 async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
     numeros: list[str] = []
     base = inst["base"]
-    headers = {"User-Agent": UA, "Accept": "application/json"}
+    consulta_url = f"{base}/ConsultaPublica/listView.seam"
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=25) as c:
         # Tentativa 1: REST JSON
         for url in [
             f"{base}/rest/processo/consultapublica?oabNumero={oab}&oabUF={uf}&pagina=0&tamanhoPagina=50",
             f"{base}/api/v1/processos?oabNumero={oab}&oabUf={uf}&size=50",
         ]:
             try:
-                r = await c.get(url, headers=headers)
+                r = await c.get(url, headers={"User-Agent": UA, "Accept": "application/json"})
                 if r.status_code == 200 and "json" in r.headers.get("content-type", ""):
                     j = r.json()
                     items = j.get("content") or j.get("processos") or (j if isinstance(j, list) else [])
@@ -172,30 +172,45 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
             except Exception as e:
                 print(f"[PJe] {inst['nome']} REST: {e}")
 
-        # Tentativa 2: GET ViewState + POST HTML
+        # Tentativa 2: GET página → extrai todos campos hidden → POST com OAB
         try:
-            rg = await c.get(f"{base}/ConsultaPublica/listView.seam",
-                             headers={"User-Agent": UA})
-            vs_match = re.search(r'id="javax\.faces\.ViewState"[^>]*value="([^"]+)"', rg.text)
-            vs = vs_match.group(1) if vs_match else "j_id1"
+            rg = await c.get(consulta_url, headers={"User-Agent": UA})
+            html_get = rg.text
+
+            # Extrai todos inputs com seus valores atuais
+            form_data: dict[str, str] = {}
+            for m in re.finditer(r'<input([^>]+)>', html_get, re.IGNORECASE):
+                attrs = m.group(1)
+                name  = re.search(r'name="([^"]*)"',  attrs)
+                value = re.search(r'value="([^"]*)"', attrs)
+                if name:
+                    form_data[name.group(1)] = value.group(1) if value else ""
+
+            # Campos obrigatórios do RichFaces/JSF
+            nome = inst["nome"]
+            if "TJCE" in nome:
+                form_data["fPP:Decoration:numeroOAB"] = oab
+                form_data["fPP:searchProcessos"]      = "Pesquisar"
+            else:
+                # Outros PJe podem usar campos diferentes
+                for key in list(form_data.keys()):
+                    if "oab" in key.lower() and "numero" in key.lower():
+                        form_data[key] = oab
+                form_data["javax.faces.ViewState"] = form_data.get("javax.faces.ViewState", "j_id1")
 
             rp = await c.post(
-                f"{base}/ConsultaPublica/listView.seam",
-                headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
-                         "Referer": f"{base}/ConsultaPublica/listView.seam"},
-                data={
-                    "j_id132:oabNumero": oab,
-                    "j_id132:oabUF": uf,
-                    "javax.faces.ViewState": vs,
-                },
+                consulta_url,
+                headers={"User-Agent": UA,
+                         "Content-Type": "application/x-www-form-urlencoded",
+                         "Referer": consulta_url},
+                data=form_data,
             )
             if rp.status_code == 200:
-                found = list(set(CNJ_RE.findall(rp.text)))
+                found = [n for n in set(CNJ_RE.findall(rp.text)) if numero_valido(n)]
                 for n in found:
-                    if n not in numeros and numero_valido(n):
+                    if n not in numeros:
                         numeros.append(n)
-                if found:
-                    print(f"[PJe] {inst['nome']} HTML: {len(found)}")
+                print(f"[PJe] {inst['nome']} HTML: {len(found)} válidos")
         except Exception as e:
             print(f"[PJe] {inst['nome']} HTML: {e}")
 
