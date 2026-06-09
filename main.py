@@ -140,9 +140,10 @@ async def esaj_buscar(oab: str, uf: str, jsession: str) -> list[str]:
 # ─── PJe (TJCE, TRT7, TRF5) ──────────────────────────────────────────────────
 
 PJE_INSTANCIAS_CE = [
-    {"nome": "TJCE", "base": "https://pje.tjce.jus.br/pje", "tribunal": "TJCE"},
-    {"nome": "TRT7", "base": "https://pje.trt7.jus.br/pje",  "tribunal": "TRT7"},
-    {"nome": "TRF5", "base": "https://pje.trf5.jus.br/pje",  "tribunal": "TRF5"},
+    {"nome": "TJCE-1G", "base": "https://pje-consulta.tjce.jus.br/pje1grau", "tribunal": "TJCE"},
+    {"nome": "TJCE-2G", "base": "https://pje-consulta.tjce.jus.br/pje2grau", "tribunal": "TJCE"},
+    {"nome": "TRT7",    "base": "https://pje.trt7.jus.br/pje",               "tribunal": "TRT7"},
+    {"nome": "TRF5",    "base": "https://pje.trf5.jus.br/pje",               "tribunal": "TRF5"},
 ]
 
 async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
@@ -205,6 +206,40 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
 @app.get("/health")
 def health():
     return {"ok": True, "service": "lexia-scraper"}
+
+@app.post("/pje-debug")
+async def pje_debug(authorization: str = Header(...)):
+    check_auth(authorization)
+    base = "https://pje-consulta.tjce.jus.br/pje1grau"
+    result = {}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+        try:
+            rg = await c.get(f"{base}/ConsultaPublica/listView.seam", headers={"User-Agent": UA})
+            result["get_status"] = rg.status_code
+            result["final_url"] = str(rg.url)
+            html = rg.text
+            result["html_len"] = len(html)
+            # Extrai ViewState
+            vs = re.search(r'id="javax\.faces\.ViewState"[^>]*value="([^"]+)"', html)
+            result["viewstate"] = vs.group(1)[:80] if vs else "NÃO ENCONTRADO"
+            # Extrai todos os inputs do form
+            inputs = re.findall(r'<input[^>]+name="([^"]+)"', html)
+            result["form_fields"] = list(set(inputs))
+            # Tenta POST com OAB
+            if vs:
+                rp = await c.post(
+                    f"{base}/ConsultaPublica/listView.seam",
+                    headers={"User-Agent": UA, "Content-Type": "application/x-www-form-urlencoded",
+                             "Referer": f"{base}/ConsultaPublica/listView.seam"},
+                    data={"javax.faces.ViewState": vs.group(1), **{f: "10727" if "oab" in f.lower() else ("CE" if "uf" in f.lower() or "estado" in f.lower() else "") for f in inputs if "oab" in f.lower() or "uf" in f.lower() or "estado" in f.lower()}},
+                )
+                result["post_status"] = rp.status_code
+                result["post_url"] = str(rp.url)
+                result["numeros"] = list(set(CNJ_RE.findall(rp.text)))
+                result["post_snippet"] = rp.text[:800]
+        except Exception as e:
+            result["error"] = str(e)
+    return result
 
 @app.post("/esaj-debug")
 async def esaj_debug(authorization: str = Header(...)):
