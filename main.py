@@ -23,6 +23,14 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 CNJ_RE = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 
+def numero_valido(n: str) -> bool:
+    """Rejeita números placeholder (ano fora de 1990-2030, dígitos repetidos)."""
+    try:
+        ano = int(n[8:12])
+        return 1990 <= ano <= 2030 and n != "9999999-99.9999.9.99.9999"
+    except Exception:
+        return False
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def check_auth(authorization: str):
@@ -121,7 +129,7 @@ async def esaj_buscar(oab: str, uf: str, jsession: str) -> list[str]:
             if not found:
                 break
             for n in found:
-                if n not in numeros:
+                if n not in numeros and numero_valido(n):
                     numeros.append(n)
 
             if not any(x in html for x in ["Próxima", "próxima", "paginaConsulta"]):
@@ -155,7 +163,7 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
                     items = j.get("content") or j.get("processos") or (j if isinstance(j, list) else [])
                     for item in items:
                         n = item.get("numeroProcesso") or item.get("numero")
-                        if n and CNJ_RE.match(n) and n not in numeros:
+                        if n and CNJ_RE.match(n) and numero_valido(n) and n not in numeros:
                             numeros.append(n)
                     if numeros:
                         print(f"[PJe] {inst['nome']} REST: {len(numeros)}")
@@ -183,7 +191,7 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
             if rp.status_code == 200:
                 found = list(set(CNJ_RE.findall(rp.text)))
                 for n in found:
-                    if n not in numeros:
+                    if n not in numeros and numero_valido(n):
                         numeros.append(n)
                 if found:
                     print(f"[PJe] {inst['nome']} HTML: {len(found)}")
