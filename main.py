@@ -6,7 +6,7 @@ estrangeiros pelos portais dos tribunais.
 Salva os processos encontrados diretamente no Supabase via service_role.
 """
 
-import os, re, asyncio, httpx
+import os, re, json, asyncio, datetime, httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -401,3 +401,112 @@ async def pje_sync(authorization: str = Header(...)):
     except Exception as e:
         import traceback
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
+# ─── DJe TJCE (publicações) ───────────────────────────────────────────────────
+
+def hoje_str() -> str:
+    return datetime.date.today().isoformat()
+
+def ontem_str() -> str:
+    return (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+
+def extrair_trechos(texto: str, oab: str) -> list[str]:
+    plain = re.sub(r"<[^>]+>", " ", texto)
+    plain = re.sub(r"\s+", " ", plain)
+    return re.findall(r".{0,300}" + re.escape(oab) + r".{0,300}", plain)
+
+async def dje_buscar(oab: str, uf: str) -> list[dict]:
+    resultado: list[dict] = []
+    for data in [hoje_str(), ontem_str()]:
+        dt_br = "/".join(reversed(data.split("-")))  # YYYY-MM-DD → DD/MM/YYYY
+        params = {
+            "dadosConsulta": json.dumps({"tipoPesquisa": "NUMERO_OAB", "pesquisa": oab, "estado": uf}),
+            "dtIni": dt_br, "dtFim": dt_br,
+            "cdCaderno": "", "pagina": "1", "tamPagina": "50",
+        }
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=25) as c:
+                r = await c.get(
+                    "https://esaj.tjce.jus.br/cdje/consultaAvancada.do",
+                    params=params, headers={"User-Agent": UA},
+                )
+            if r.status_code != 200:
+                continue
+            html = r.text
+            if oab not in html:
+                continue
+            for i, trecho in enumerate(extrair_trechos(html, oab)):
+                m = CNJ_RE.search(trecho)
+                resultado.append({
+                    "external_id": f"tjce-{data}-{oab}-{i}",
+                    "data": data,
+                    "tribunal": "TJCE",
+                    "numero_processo": m.group(0) if m else None,
+                    "conteudo": trecho[:5000],
+                    "advogado_oab": f"{uf} {oab}",
+                })
+        except Exception as e:
+            print(f"[DJe] {data}: {e}")
+    return resultado
+
+def get_or_create_processo(org_id: str, owner_id: str, numero: Optional[str]) -> Optional[str]:
+    if not numero:
+        return None
+    try:
+        res = sb.from_("processos").select("id")\
+                .eq("organization_id", org_id).eq("numero", numero).limit(1).execute()
+        if res and res.data:
+            return res.data[0]["id"]
+    except Exception:
+        pass
+    novo = sb.from_("processos").insert({
+        "organization_id": org_id, "owner_id": owner_id, "numero": numero,
+        "titulo": f"Processo {numero}", "tribunal": "TJCE",
+        "status": "ativo", "fonte": "DJe",
+    }).execute()
+    return novo.data[0]["id"] if novo.data else None
+
+def salvar_publicacao(org_id: str, owner_id: str, processo_id: Optional[str], pub: dict) -> bool:
+    try:
+        sb.from_("publicacoes").upsert({
+            "organization_id": org_id, "owner_id": owner_id, "processo_id": processo_id,
+            "external_id": pub["external_id"], "advogado_oab": pub["advogado_oab"],
+            "data_publicacao": pub["data"], "tribunal": pub["tribunal"],
+            "texto": pub["conteudo"], "fonte": "DJe",
+        }, on_conflict="external_id", ignore_duplicates=True).execute()
+        return True
+    except Exception as e:
+        print(f"[DJe] salvar publicação: {e}")
+        return False
+
+@app.post("/dje-sync")
+async def dje_sync(authorization: str = Header(...)):
+    check_auth(authorization)
+
+    oabs_res = sb.from_("oabs_monitoradas")\
+                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                 .eq("ativo", True)\
+                 .execute()
+    oabs = oabs_res.data or []
+    if not oabs:
+        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+
+    total = 0
+    for row in oabs:
+        if row["estado_oab"] != "CE":
+            continue
+        org_id = row["organization_id"]
+        oab    = row["numero_oab"]
+
+        owner_id = get_owner(org_id)
+        if not owner_id:
+            continue
+
+        pubs = await dje_buscar(oab, row["estado_oab"])
+        print(f"[DJe] CE {oab}: {len(pubs)} publicações")
+        for pub in pubs:
+            processo_id = get_or_create_processo(org_id, owner_id, pub["numero_processo"])
+            if salvar_publicacao(org_id, owner_id, processo_id, pub):
+                total += 1
+
+    return {"ok": True, "fonte": "DJe", "publicacoes_novas": total}
