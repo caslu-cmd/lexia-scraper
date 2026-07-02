@@ -466,17 +466,17 @@ def get_or_create_processo(org_id: str, owner_id: str, numero: Optional[str]) ->
     }).execute()
     return novo.data[0]["id"] if novo.data else None
 
-def salvar_publicacao(org_id: str, owner_id: str, processo_id: Optional[str], pub: dict) -> bool:
+def salvar_publicacao(org_id: str, owner_id: str, processo_id: Optional[str], pub: dict, fonte: str = "DJe") -> bool:
     try:
         sb.from_("publicacoes").upsert({
             "organization_id": org_id, "owner_id": owner_id, "processo_id": processo_id,
             "external_id": pub["external_id"], "advogado_oab": pub["advogado_oab"],
             "data_publicacao": pub["data"], "tribunal": pub["tribunal"],
-            "texto": pub["conteudo"], "fonte": "DJe",
+            "texto": pub["conteudo"], "fonte": fonte,
         }, on_conflict="external_id", ignore_duplicates=True).execute()
         return True
     except Exception as e:
-        print(f"[DJe] salvar publicação: {e}")
+        print(f"[{fonte}] salvar publicação: {e}")
         return False
 
 @app.post("/dje-sync")
@@ -510,3 +510,81 @@ async def dje_sync(authorization: str = Header(...)):
                 total += 1
 
     return {"ok": True, "fonte": "DJe", "publicacoes_novas": total}
+
+# ─── DJEN (Diário de Justiça Eletrônico NACIONAL — API CNJ Comunica) ───────────
+# O DJEN é o diário unificado do CNJ; é onde caem as intimações com prazo do PJe.
+# O Escavador atrasa/perde essas; aqui pegamos direto da fonte oficial (por OAB).
+DJEN_API = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
+
+async def djen_buscar(oab: str, uf: str, dias: int = 3) -> list[dict]:
+    fim = datetime.date.today()
+    ini = fim - datetime.timedelta(days=dias)
+    num = re.sub(r"\D", "", str(oab))
+    resultado: list[dict] = []
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as c:
+        for pagina in range(1, 7):
+            params = {
+                "numeroOab": num, "ufOab": uf.upper(),
+                "dataDisponibilizacaoInicio": ini.isoformat(),
+                "dataDisponibilizacaoFim": fim.isoformat(),
+                "itensPorPagina": "100", "pagina": str(pagina),
+            }
+            try:
+                r = await c.get(DJEN_API, params=params,
+                                headers={"User-Agent": UA, "Accept": "application/json"})
+                if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
+                    print(f"[DJEN] {uf}-{num} p{pagina}: HTTP {r.status_code} ct={r.headers.get('content-type')}")
+                    break
+                items = (r.json() or {}).get("items") or []
+            except Exception as e:
+                print(f"[DJEN] {uf}-{num} p{pagina}: {e}")
+                break
+            if not items:
+                break
+            for it in items:
+                resultado.append({
+                    "external_id": f"djen-{it.get('id')}",
+                    "data": str(it.get("data_disponibilizacao") or fim.isoformat())[:10],
+                    "tribunal": it.get("siglaTribunal") or "",
+                    "numero_processo": it.get("numeroprocessocommascara"),
+                    "conteudo": str(it.get("texto") or "(sem conteudo)")[:5000],
+                    "advogado_oab": f"{uf} {num}",
+                })
+            if len(items) < 100:
+                break
+    return resultado
+
+@app.post("/djen-sync")
+async def djen_sync(authorization: str = Header(...), dias: int = 3):
+    check_auth(authorization)
+    oabs_res = sb.from_("oabs_monitoradas")\
+                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                 .eq("ativo", True).execute()
+    oabs = oabs_res.data or []
+    if not oabs:
+        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+
+    vistas = 0
+    total = 0
+    log: list[str] = []
+    for row in oabs:
+        org_id = row["organization_id"]
+        oab = row["numero_oab"]
+        uf = row["estado_oab"]
+        owner_id = get_owner(org_id)
+        if not owner_id:
+            log.append(f"sem owner org {org_id}")
+            continue
+        try:
+            pubs = await djen_buscar(oab, uf, dias)
+        except Exception as e:
+            log.append(f"{uf}-{oab}: {e}")
+            continue
+        vistas += len(pubs)
+        for pub in pubs:
+            processo_id = get_or_create_processo(org_id, owner_id, pub["numero_processo"])
+            if salvar_publicacao(org_id, owner_id, processo_id, pub, fonte="DJEN"):
+                total += 1
+        log.append(f"{uf}-{oab}: {len(pubs)} comunicações")
+
+    return {"ok": True, "fonte": "DJEN", "vistas": vistas, "publicacoes_novas": total, "log": log}
