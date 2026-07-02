@@ -38,13 +38,14 @@ def check_auth(authorization: str):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def get_owner(organization_id: str) -> Optional[str]:
+    # limit(1) em vez de single(): a org pode ter VÁRIOS admins (single() quebra).
     r = sb.from_("organization_members")\
           .select("user_id")\
           .eq("organization_id", organization_id)\
           .eq("role", "admin")\
-          .single()\
+          .limit(1)\
           .execute()
-    return r.data["user_id"] if r.data else None
+    return r.data[0]["user_id"] if r.data else None
 
 def salvar_processo(organization_id: str, owner_id: str, numero: str,
                     nome: str, tribunal: str, fonte: str) -> bool:
@@ -557,34 +558,45 @@ async def djen_buscar(oab: str, uf: str, dias: int = 3) -> list[dict]:
 @app.post("/djen-sync")
 async def djen_sync(authorization: str = Header(...), dias: int = 3):
     check_auth(authorization)
-    oabs_res = sb.from_("oabs_monitoradas")\
-                 .select("organization_id,numero_oab,estado_oab,nome_advogado")\
-                 .eq("ativo", True).execute()
-    oabs = oabs_res.data or []
-    if not oabs:
-        return {"ok": True, "msg": "Nenhuma OAB ativa."}
+    try:
+        oabs_res = sb.from_("oabs_monitoradas")\
+                     .select("organization_id,numero_oab,estado_oab,nome_advogado")\
+                     .eq("ativo", True).execute()
+        oabs = oabs_res.data or []
+        if not oabs:
+            return {"ok": True, "msg": "Nenhuma OAB ativa."}
 
-    vistas = 0
-    total = 0
-    log: list[str] = []
-    for row in oabs:
-        org_id = row["organization_id"]
-        oab = row["numero_oab"]
-        uf = row["estado_oab"]
-        owner_id = get_owner(org_id)
-        if not owner_id:
-            log.append(f"sem owner org {org_id}")
-            continue
-        try:
-            pubs = await djen_buscar(oab, uf, dias)
-        except Exception as e:
-            log.append(f"{uf}-{oab}: {e}")
-            continue
-        vistas += len(pubs)
-        for pub in pubs:
-            processo_id = get_or_create_processo(org_id, owner_id, pub["numero_processo"])
-            if salvar_publicacao(org_id, owner_id, processo_id, pub, fonte="DJEN"):
-                total += 1
-        log.append(f"{uf}-{oab}: {len(pubs)} comunicações")
+        vistas = 0
+        total = 0
+        log: list[str] = []
+        for row in oabs:
+            org_id = row["organization_id"]
+            oab = row["numero_oab"]
+            uf = row["estado_oab"]
+            try:
+                owner_id = get_owner(org_id)
+            except Exception as e:
+                log.append(f"owner org {org_id}: {e}")
+                continue
+            if not owner_id:
+                log.append(f"sem owner org {org_id}")
+                continue
+            try:
+                pubs = await djen_buscar(oab, uf, dias)
+            except Exception as e:
+                log.append(f"{uf}-{oab}: {e}")
+                continue
+            vistas += len(pubs)
+            for pub in pubs:
+                try:
+                    processo_id = get_or_create_processo(org_id, owner_id, pub["numero_processo"])
+                    if salvar_publicacao(org_id, owner_id, processo_id, pub, fonte="DJEN"):
+                        total += 1
+                except Exception as e:
+                    log.append(f"salvar {pub.get('external_id')}: {e}")
+            log.append(f"{uf}-{oab}: {len(pubs)} comunicações")
 
-    return {"ok": True, "fonte": "DJEN", "vistas": vistas, "publicacoes_novas": total, "log": log}
+        return {"ok": True, "fonte": "DJEN", "vistas": vistas, "publicacoes_novas": total, "log": log}
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-1200:]}
