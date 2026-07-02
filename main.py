@@ -517,28 +517,33 @@ async def dje_sync(authorization: str = Header(...)):
 # O Escavador atrasa/perde essas; aqui pegamos direto da fonte oficial (por OAB).
 DJEN_API = "https://comunicaapi.pje.jus.br/api/v1/comunicacao"
 
-async def djen_buscar(oab: str, uf: str, dias: int = 3) -> list[dict]:
-    fim = datetime.date.today()
-    ini = fim - datetime.timedelta(days=dias)
+async def djen_buscar(oab: str, uf: str, dias: int = 3,
+                      data_inicio: str = "", data_fim: str = "") -> tuple[list[dict], str]:
+    fim = data_fim or datetime.date.today().isoformat()
+    ini = data_inicio or (datetime.date.today() - datetime.timedelta(days=dias)).isoformat()
     num = re.sub(r"\D", "", str(oab))
     resultado: list[dict] = []
+    diag = ""
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as c:
         for pagina in range(1, 7):
             params = {
                 "numeroOab": num, "ufOab": uf.upper(),
-                "dataDisponibilizacaoInicio": ini.isoformat(),
-                "dataDisponibilizacaoFim": fim.isoformat(),
+                "dataDisponibilizacaoInicio": ini,
+                "dataDisponibilizacaoFim": fim,
                 "itensPorPagina": "100", "pagina": str(pagina),
             }
             try:
                 r = await c.get(DJEN_API, params=params,
                                 headers={"User-Agent": UA, "Accept": "application/json"})
+                if pagina == 1:
+                    diag = f"HTTP {r.status_code} ct={(r.headers.get('content-type') or '')[:20]} janela={ini}..{fim}"
                 if r.status_code != 200 or "json" not in r.headers.get("content-type", ""):
-                    print(f"[DJEN] {uf}-{num} p{pagina}: HTTP {r.status_code} ct={r.headers.get('content-type')}")
                     break
                 items = (r.json() or {}).get("items") or []
+                if pagina == 1:
+                    diag += f" itens_p1={len(items)}"
             except Exception as e:
-                print(f"[DJEN] {uf}-{num} p{pagina}: {e}")
+                diag = f"ERRO {type(e).__name__}"
                 break
             if not items:
                 break
@@ -553,10 +558,11 @@ async def djen_buscar(oab: str, uf: str, dias: int = 3) -> list[dict]:
                 })
             if len(items) < 100:
                 break
-    return resultado
+    return resultado, diag
 
 @app.post("/djen-sync")
-async def djen_sync(authorization: str = Header(...), dias: int = 3):
+async def djen_sync(authorization: str = Header(...), dias: int = 3,
+                    data_inicio: str = "", data_fim: str = ""):
     check_auth(authorization)
     try:
         oabs_res = sb.from_("oabs_monitoradas")\
@@ -582,7 +588,7 @@ async def djen_sync(authorization: str = Header(...), dias: int = 3):
                 log.append(f"sem owner org {org_id}")
                 continue
             try:
-                pubs = await djen_buscar(oab, uf, dias)
+                pubs, diag = await djen_buscar(oab, uf, dias, data_inicio, data_fim)
             except Exception as e:
                 log.append(f"{uf}-{oab}: {e}")
                 continue
@@ -594,7 +600,7 @@ async def djen_sync(authorization: str = Header(...), dias: int = 3):
                         total += 1
                 except Exception as e:
                     log.append(f"salvar {pub.get('external_id')}: {e}")
-            log.append(f"{uf}-{oab}: {len(pubs)} comunicações")
+            log.append(f"{uf}-{oab}: {len(pubs)} novas | {diag}")
 
         return {"ok": True, "fonte": "DJEN", "vistas": vistas, "publicacoes_novas": total, "log": log}
     except Exception as e:
