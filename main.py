@@ -229,6 +229,17 @@ async def pje_buscar(inst: dict, oab: str, uf: str) -> list[str]:
 def health():
     return {"ok": True, "service": "lexia-scraper"}
 
+@app.get("/myip")
+async def myip():
+    """Retorna o IP/país de saída do serviço — pra confirmar se está em região BR."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get("https://ipinfo.io/json", headers={"User-Agent": UA})
+            j = r.json()
+        return {"ip": j.get("ip"), "country": j.get("country"), "region": j.get("region"), "city": j.get("city"), "org": j.get("org")}
+    except Exception as e:
+        return {"erro": str(e)}
+
 @app.post("/pje-debug")
 async def pje_debug(authorization: str = Header(...)):
     check_auth(authorization)
